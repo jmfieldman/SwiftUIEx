@@ -2,7 +2,7 @@
 
 SwiftUIEx is a small library for embedding SwiftUI screens inside a **UIKit navigation stack** without writing the same `UIHostingController` boilerplate on every screen. It commits to the **`@Observable`** model: no Combine, no CombineEx, no `@State`-per-property bridging — just a shared observable view-model handed from a controller-side coordinator down to the SwiftUI view.
 
-The library is intentionally tiny — three types — and stops there. It is not a navigation framework, not a coordinator framework, and not a replacement for SwiftUI's own state primitives. It is the thin seam that makes "SwiftUI screen, UIKit nav" a one-line subclass instead of thirty lines of repeated scaffolding.
+The library is intentionally tiny — three screen-plumbing types plus one narrow coordinator primitive — and stops there. It is not a general navigation framework, it is not opinionated about how you choose to push, present, or dismiss screens, and it is not a replacement for SwiftUI's own state primitives. It is the thin seam that makes "SwiftUI screen, UIKit nav" a one-line subclass instead of thirty lines of repeated scaffolding, plus a single `RequirementCoordinator` that captures one specific reactive pattern that composes especially cleanly into Observable.
 
 ## Why this exists
 
@@ -251,6 +251,104 @@ Pick the one whose constraints best match the screen. A common pragmatic rule of
 
 The included `Tests/SwiftUIExTests/ExampleStackTests.swift` demonstrates both shapes against the same `HostedView`/`HostingScreen` to show that they compose interchangeably.
 
+## `RequirementCoordinator`
+
+One additional type, scoped narrowly. Many apps have flows that look like *"gate the user through a list of reactive requirements — log in, complete profile, accept terms — and advance as each becomes satisfied."* That pattern composes cleanly into `@Observable` and is tedious to rewrite per-app, so SwiftUIEx ships it.
+
+A `RequirementCoordinator` is built from an array of `RequirementCoordinatorNode`s; each node pairs a main-actor `isSatisfied` predicate with a main-actor `makeViewController` factory. The coordinator reads `isSatisfied` under `withObservationTracking`, so any mutation on any `@Observable` property the closure reads re-fires the check.
+
+The canonical pattern is **prime → present → run**. `prime` does three things in a single synchronous call: reports whether anything needs to happen, attaches the nav controller to the coordinator, and places the first unsatisfied node's view controller on the nav. Because the first VC is on the nav before `present` is called, the presentation animation shows real content on its first frame — no blank-nav flash.
+
+```swift
+import SwiftUIEx
+import UIKit
+
+let coord = RequirementCoordinator(nodes: [
+    .init(
+        isSatisfied: { auth.isLoggedIn },
+        makeViewController: { LoginScreen(auth: auth) }
+    ),
+    .init(
+        isSatisfied: { profile.isComplete },
+        makeViewController: { ProfileCompletionScreen(profile: profile) }
+    ),
+])
+
+let nav = UINavigationController()
+
+// 1. Prime. Returns false if every requirement is already satisfied — in
+//    which case there is no flow to run and the caller can skip presenting
+//    the nav controller entirely.
+guard coord.prime(nav, animated: false) else {
+    // proceed directly to whatever would follow the flow
+    return
+}
+
+// 2. Present.
+present(nav, animated: true)
+
+// 3. Run.
+Task {
+    do {
+        try await coord.run()
+        // All requirements satisfied — caller decides what next.
+        nav.dismiss(animated: true)
+    } catch {
+        // Task cancelled, or the nav was released — caller decides.
+    }
+}
+```
+
+### Push strategy
+
+`prime` decides how to place the first view controller based on the nav's current state:
+
+- **Empty nav:** `setViewControllers([vc], animated: false)`. The `animated:` argument is ignored — there's no meaningful source frame for an animation onto an empty stack.
+- **Populated nav:** `pushViewController(vc, animated: animated)`. Honors the caller's choice.
+
+This rule is what makes the coordinator *chain-friendly* against a shared nav: once a flow completes, a second coordinator can prime onto the same nav and its first screen will animate-push onto the stack the first flow left behind.
+
+```swift
+let nav = UINavigationController()
+
+guard authCoord.prime(nav, animated: false) else { /* already authed */ }
+present(nav, animated: true)
+try await authCoord.run()
+
+// Chain onto the same nav. Nav is now populated with authCoord's last
+// screen, so the animated-push rule kicks in.
+guard profileCoord.prime(nav, animated: true) else {
+    nav.dismiss(animated: true)
+    return
+}
+try await profileCoord.run()
+
+nav.dismiss(animated: true)
+```
+
+Each coordinator is one-shot — calling `prime` twice on the same coordinator is a programming error and trips a precondition. Use a fresh coordinator per stage.
+
+### API surface
+
+- **`prime(_ nav: UINavigationController, animated: Bool) -> Bool`** — synchronous. Attaches the nav controller (weakly), places the first unsatisfied node's view controller on it, and returns `true` if there is a flow to run. Returns `false` when every node is already satisfied and leaves the nav controller untouched. Call exactly once per coordinator.
+- **`run() async throws`** — asynchronous. Observes the current node's satisfaction via `withObservationTracking`, pauses `advanceDelay` (default 350 ms) between nodes so the user sees the success state, pushes subsequent unsatisfied nodes animated, and returns when every node is satisfied. Throws `CancellationError` on task cancellation, or if the nav controller is released before the next push.
+- **`nodes.areAllSatisfied`** (Array extension) — pure point-in-time query. Use when you want to check completion state without attaching the coordinator to a nav or creating any view controllers.
+
+### Lifetime details
+
+- The coordinator holds the navigation controller **weakly**. If the caller dismisses and releases the nav without cancelling the `Task`, `run()` surfaces the disappearance as `CancellationError` on the next push rather than pinning the nav alive until satisfaction.
+- Calling `run()` before `prime`, or after `prime` returned `false`, is a silent no-op. The canonical guard-on-prime pattern keeps this branch unreachable in correct code.
+- If an external mutation satisfies the primed node in the narrow window between `prime` and `run()` (a rare race), `run()` detects the staleness and pushes the current first-unsatisfied node animated. The stale primed VC stays wherever it was in the stack.
+
+### What it deliberately does **not** do
+
+- It does not present anything. The caller owns presentation.
+- It does not pop, dismiss, or otherwise modify the navigation controller on completion. When `run(in:)` returns, the last node's view controller is still on the stack, and the caller decides what to do with that (dismiss the nav controller, pop to root, push a result screen, etc).
+- It does not detect "the user swiped the nav controller away" or similar external dismissals. If the owning Task is cancelled, the coordinator throws `CancellationError`; otherwise it simply waits for satisfaction.
+- It does not require that the nodes' view controllers be `HostingScreen`s. Any `UIViewController` is fine — UIKit screens, SwiftUI screens, mixed.
+
+This is deliberately *one* coordinator, not a coordinator *framework*. If you need a general-purpose routing primitive, this is not it — SwiftUIEx is opinionated about staying small, and the bar for a second coordinator type is the same bar the rest of the library lives by.
+
 ## Pairing with SwiftAsyncEx
 
 SwiftUIEx makes the controller / view seam ergonomic; it does not provide the patterns you need to actually *react* to upstream `@Observable` state or to bound `Task`s by lifetime. Those belong in [SwiftAsyncEx](https://github.com/jmfieldman/SwiftAsyncEx), which is the lower-level companion library:
@@ -263,7 +361,7 @@ Neither library depends on the other. SwiftAsyncEx is platform-light (iOS 17, no
 
 ## Design principles
 
-1. **Three types, no more.** The library exposes exactly `HostedView`, `HostingScreenModel`, and `HostingScreen`. If a fourth type is tempting, it probably belongs in the consuming app or in SwiftAsyncEx.
+1. **Three screen-plumbing types plus one coordinator, and that's it.** The library exposes exactly `HostedView`, `HostingScreenModel`, `HostingScreen`, and the `RequirementCoordinator` / `RequirementCoordinatorNode` pair. If a sixth type is tempting, it probably belongs in the consuming app or in SwiftAsyncEx.
 2. **No new state primitive.** No `@StateObject`-flavored wrapper, no Combine bridge, no stream type. Everything composes with `@Observable`, `let viewModel`, plain `var` properties, and plain closures.
 3. **Strict on the contract, loose on the body.** The protocols pin down the wiring (`init(viewModel:)`, weak `viewController`, `viewModel` getter); they say nothing about how consumers shape their ViewModels or organize their dependencies.
 4. **No lifecycle opinions.** `HostingScreen` does not override `viewDidLoad`, `viewWillAppear`, or any other UIKit lifecycle method. Subclasses and apps own appearance, layout-margin, and configuration concerns.
@@ -271,7 +369,7 @@ Neither library depends on the other. SwiftAsyncEx is platform-light (iOS 17, no
 
 ## Non-goals
 
-- A navigation or coordinator framework. Navigation is whatever you write in your `HostingScreenModel` against `viewController?.navigationController` — push, present, dismiss, custom transitions, your call.
+- A general navigation or coordinator framework. Navigation is whatever you write in your `HostingScreenModel` against `viewController?.navigationController` — push, present, dismiss, custom transitions, your call. The one exception is the narrow `RequirementCoordinator` primitive described above, which is scoped tightly to reactive requirement-gate flows and is unopinionated about how its attached navigation controller is presented or torn down.
 - A dependency-injection framework. The `HostingScreenModel` accepts whatever its `init` wants. Use Inject, use plain init parameters, use a service locator — orthogonal to this library.
 - Anything Combine, ReactiveSwift, or stream-based. The whole point of this library is the `@Observable`-only commitment.
 - Bridging into pure-SwiftUI navigation (`NavigationStack`, `NavigationPath`). Those work fine on their own — SwiftUIEx exists specifically because pure-SwiftUI navigation is not what every app uses.
