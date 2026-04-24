@@ -120,12 +120,14 @@ public final class RequirementCoordinator {
     ///     become current are skipped without ever calling
     ///     `makeViewController`.
     ///   - advanceDelay: Pause after each node becomes satisfied. Defaults
-    ///     to `350 ms` — short enough to feel responsive, long enough for
-    ///     the user to register the success state. Pass `.zero` to advance
-    ///     immediately.
+    ///     to `1 ms` — effectively immediate, but long enough to ensure
+    ///     the advance occurs on a main run-loop tick after any side
+    ///     effects from satisfaction have settled. Pass `.zero` to advance
+    ///     synchronously, or a larger value (e.g. `350 ms`) to let the
+    ///     user register the success state before moving on.
     public init(
         nodes: [RequirementCoordinatorNode],
-        advanceDelay: Duration = .milliseconds(350)
+        advanceDelay: Duration = .milliseconds(1)
     ) {
         self.nodes = nodes
         self.advanceDelay = advanceDelay
